@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SGI Enterprise</title>
+    <script>
+      window.onerror = function(message, source, lineno, colno, error) {
+        var div = document.createElement('div');
+        div.style.position = 'fixed';
+        div.style.top = '0';
+        div.style.left = '0';
+        div.style.width = '100%';
+        div.style.height = '100%';
+        div.style.backgroundColor = '#fff';
+        div.style.color = '#ff0000';
+        div.style.padding = '30px';
+        div.style.zIndex = '999999';
+        div.style.fontFamily = 'monospace';
+        div.style.fontSize = '14px';
+        div.style.overflow = 'auto';
+        div.innerHTML = '<h1>❌ Error de JavaScript Detectado:</h1><pre>' + message + '\n\nEnlace: ' + source + ':' + lineno + ':' + colno + '\n\nStack Trace:\n' + (error ? error.stack : 'No disponible') + '</pre>';
+        document.body.appendChild(div);
+        return false;
+      };
+      window.onunhandledrejection = function(event) {
+        var div = document.createElement('div');
+        div.style.position = 'fixed';
+        div.style.top = '0';
+        div.style.left = '0';
+        div.style.width = '100%';
+        div.style.height = '100%';
+        div.style.backgroundColor = '#fff';
+        div.style.color = '#ff0000';
+        div.style.padding = '30px';
+        div.style.zIndex = '999999';
+        div.style.fontFamily = 'monospace';
+        div.style.fontSize = '14px';
+        div.style.overflow = 'auto';
+        div.innerHTML = '<h1>❌ Promesa Rechazada no Manejada:</h1><pre>' + event.reason + '\n\nStack:\n' + (event.reason && event.reason.stack ? event.reason.stack : 'No disponible') + '</pre>';
+        document.body.appendChild(div);
+      };
+      setTimeout(function() {
+        var root = document.getElementById('root');
+        if (root && root.innerHTML.indexOf('Cargando...') !== -1) {
+          var div = document.createElement('div');
+          div.style.position = 'fixed';
+          div.style.bottom = '20px';
+          div.style.right = '20px';
+          div.style.backgroundColor = '#1e293b';
+          div.style.color = '#f8fafc';
+          div.style.padding = '20px';
+          div.style.borderRadius = '8px';
+          div.style.zIndex = '999999';
+          div.style.fontFamily = 'monospace';
+          div.style.fontSize = '13px';
+          div.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.3)';
+          div.style.border = '1px solid #475569';
+          div.style.maxWidth = '400px';
+          div.innerHTML = '<b style="color:#ef4444">⚠️ Diagnóstico de Bloqueo (5s colgado):</b><br/>' +
+                          '<hr style="border-color:#475569;margin:8px 0;"/>' +
+                          'LocalStorage User: ' + (window.localStorage.getItem('sgi_current_user') ? 'Presente' : 'Nulo') + '<br/>' +
+                          'Supabase Client: ' + (window.localStorage.getItem('sb-uvzbwxmwytdypoqbrddt-auth-token') ? 'Sesión Supabase Presente' : 'Sin Sesión Supabase') + '<br/><br/>' +
+                          '<b>Recomendación:</b> Limpia el caché (Ctrl + F5) o borra la memoria del sitio.';
+          document.body.appendChild(div);
+        }
+      }, 5000);
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
