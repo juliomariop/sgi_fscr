@@ -3,9 +3,26 @@
 **Alcance:** análisis estático manual del código fuente en `src/` del repositorio, enfocado en autenticación/autorización, manejo de credenciales, generación de HTML/exportables y almacenamiento en cliente.
 **Metodología:** revisión línea por línea de los módulos de autenticación (`AuthContext`, `App.jsx`), servicios externos (`supabase.js`, `oneDriveService.js`) y utilidades de exportación (`exportUtils.js`), correlacionada con búsquedas dirigidas (`document.write`, `localStorage`, `dangerouslySetInnerHTML`, rutas protegidas por rol).
 
+**Adenda — revisión ampliada (2026-09-10):** segunda pasada cubriendo el resto de `src/` (los 7 formularios públicos, todas las páginas administrativas, hooks de datos, componentes compartidos), la configuración de ESLint/Vite y un escaneo de dependencias (`npm audit`). Se agregan 15 hallazgos nuevos, verificados uno por uno directamente en el código (no solo referidos por herramienta automática), y se amplía un hallazgo existente con ubicaciones adicionales.
+
 ---
 
 ### 🔴 ALTAS
+
+* **Control de acceso roto: lectura y escritura completa sin autenticación sobre datasets de toda la organización (IDOR masivo)**
+  - **Archivo y Línea:** `src/hooks/useLocalStorage.js:25-26, 30-34, 129-149`
+  - **Descripción breve:** Toda la aplicación persiste sus datos en una única tabla Supabase `app_data` (columnas `key`, `data` JSON, `updated_at`); cada fila contiene el **arreglo completo** de una categoría (todos los reportes, todas las encuestas, todos los registros de inducción), no un registro individual. Para las claves marcadas como "públicas" en el arreglo `isPublicKey` (`sgi_customer_surveys`, `sgi_trainings`, `sgi_unsafe_reports`, `sgi_inducciones_records`), tanto el `select` (líneas 30-34) como el `upsert` (líneas 140-149) se ejecutan **sin exigir `user`/`user.id`** — es decir, sin sesión alguna.
+  - **Impacto:** Cualquier visitante anónimo que abra cualquiera de los formularios públicos (`PublicUnsafeReport.jsx:126`, `PublicCustomerSurvey.jsx:91`, `PublicEvaluation.jsx`, `PublicInductionAttendance.jsx:147`, `PublicInductionEvaluation.jsx`) descarga al navegador el historial **completo** de esa categoría para toda la organización — no solo lo relacionado con su propio envío — incluyendo datos personales (nombre, cédula, cargo, ciudad) de todos los empleados/contratistas que hayan usado ese formulario. Al enviar el formulario, el `upsert` reemplaza la fila entera: un envío malicioso (o simplemente un bug del cliente) puede borrar o corromper el historial completo de reportes/capacitaciones/inducciones de toda la empresa, no solo agregar un registro propio. Como la clave anónima de Supabase ya viaja en el bundle público, esto es ejecutable directamente contra la API de Supabase sin pasar por la interfaz de la aplicación. Nota arquitectónica: esto no se corrige solo ajustando RLS por fila, porque "agregar un registro" y "reemplazar el historial de todos" son, hoy, la misma operación (`upsert` de la fila completa) — se requiere rediseñar el almacenamiento a una fila por registro.
+  - **Remediación:** Migrar cada clave "pública" de un blob JSON único a una tabla con una fila por registro (p. ej. `unsafe_reports(id, description, worker, created_at, ...)`), con políticas RLS que permitan `insert` a `anon` pero **nunca** `select`/`update`/`delete` masivo:
+    ```sql
+    create policy "anon can insert own report"
+    on unsafe_reports for insert
+    to anon
+    with check (true); -- valida solo forma/tamaño de los campos, nunca ownership total
+
+    -- Sin policy de SELECT/UPDATE/DELETE para `anon`: por defecto, denegado.
+    ```
+    Mientras se migra, como mitigación inmediata: mover la escritura pública detrás de una Supabase Edge Function que reciba solo el registro nuevo, lo valide, y haga el `insert`/`upsert` internamente con la service role — nunca exponer al cliente un `upsert` directo sobre la fila completa.
 
 * **Control de acceso administrativo delegado al cliente (Broken Access Control)**
   - **Archivo y Línea:** `src/App.jsx:59-65`
@@ -21,15 +38,16 @@
     ```
     Adicionalmente, no fiar el gate de `AdminRoute` solo al `role` cacheado: revalidar contra `supabase.auth.getSession()` + una consulta fresca de `profiles` antes de renderizar acciones destructivas.
 
-* **Auto-asignación de rol "Administrador General" por correo hardcodeado (Authentication/Authorization Bypass)**
-  - **Archivo y Línea:** `src/context/AuthContext.jsx:34, 57, 164-165`
-  - **Descripción breve:** El código concede el rol `Administrador General` automáticamente a cualquier sesión cuyo email (normalizado) coincida con una dirección de correo personal específica hardcodeada en el bundle (ver `isJairo` en `getProfileAndSetUser` y en `signUp`). Esta lógica de autorización vive en el JavaScript del cliente, visible para cualquiera que inspeccione el código fuente.
-  - **Impacto:** Un atacante que logre registrar o tomar control de esa cuenta de correo específica en el proveedor de autenticación obtiene privilegios de administrador total automáticamente. Además, exponer la regla de negocio ("quién es el admin") en el frontend facilita que cualquiera localice ese correo en el propio código fuente e intente atacarlo puntualmente (phishing, password spraying, recuperación de cuenta), sabiendo que garantiza control total del sistema. *(Por tratarse de una dirección de correo personal real, se omite deliberadamente de este informe público; el equipo puede ubicarla en el archivo/línea indicados.)*
-  - **Remediación:** Eliminar el hardcode de correo del cliente. Definir el rol de administrador exclusivamente en el backend (columna `role` en `profiles`, gestionada por un admin existente o por una migración inicial `seed`), nunca inferido desde el email en tiempo de ejecución del navegador:
+* **Auto-asignación de rol "Administrador General" por correo hardcodeado, duplicado en 4 archivos (Authentication/Authorization Bypass)**
+  - **Archivo y Línea:** `src/context/AuthContext.jsx:34, 57, 164-165`; **reimplementado de forma independiente** en `src/pages/Dashboard.jsx:12`, `src/pages/SystemDocs.jsx:42` y `src/pages/AdminSettings.jsx:459`.
+  - **Descripción breve:** El mismo patrón (`email?.toLowerCase().trim() === '<correo hardcodeado>'`) aparece copiado en cuatro archivos distintos, no solo en `AuthContext.jsx` como se reportó inicialmente. Cada copia concede el rol `Administrador General` (o el flag `isAdmin` local) automáticamente a cualquier sesión cuyo email coincida con esa dirección personal específica hardcodeada en el bundle. Esta lógica de autorización vive en el JavaScript del cliente, visible para cualquiera que inspeccione el código fuente.
+  - **Impacto:** Un atacante que logre registrar o tomar control de esa cuenta de correo específica obtiene privilegios de administrador total automáticamente. El impacto es mayor de lo reportado originalmente: en `src/pages/SystemDocs.jsx:208,701,708` ese mismo flag (`isAdmin`) gatea directamente la aprobación y **eliminación permanente de documentos oficiales del sistema de gestión** (mover a "Obsoletos", aprobar/rechazar bajas), y en `AdminSettings.jsx:459` protege — de forma puramente cosmética — la fila de esa cuenta en el selector de cambio de rol. Al estar duplicada en 4 lugares, una futura corrección parcial (arreglar solo `AuthContext.jsx`) dejaría 3 puertas traseras funcionando igual. Exponer la regla de negocio ("quién es el admin") en el frontend también facilita que cualquiera localice ese correo en el propio código fuente e intente atacarlo puntualmente (phishing, password spraying, recuperación de cuenta). *(Por tratarse de una dirección de correo personal real, se omite deliberadamente de este informe público; el equipo puede ubicarla en los archivo/línea indicados.)*
+  - **Remediación:** Eliminar las 4 comparaciones de email hardcodeado del cliente. Definir el rol de administrador exclusivamente en el backend (columna `role` en `profiles`, gestionada por un admin existente o por una migración inicial `seed`), nunca inferido desde el email en tiempo de ejecución del navegador:
     ```js
-    // Eliminar por completo esta comparación de email hardcodeado en el cliente.
-    // El rol debe venir únicamente de data.role (columna en Supabase, protegida por RLS),
-    // nunca de una comparación de string contra un correo específico en el bundle.
+    // Eliminar por completo esta comparación de email hardcodeado, en las 4 ubicaciones.
+    // El rol/isAdmin debe derivarse únicamente de data.role (columna en Supabase,
+    // protegida por RLS), nunca de una comparación de string contra un correo
+    // específico repetida en cada componente que la necesite.
     ```
 
 * **Cross-Site Scripting (XSS) almacenado vía `document.write` sin sanitizar (Stored/DOM XSS)**
@@ -47,6 +65,24 @@
     <td>${escapeHtml(docData.description)}</td>
     ```
     Aplicar `escapeHtml` a **todo** campo proveniente de `docData` (y de sus sub-objetos `checklist`/`epccChecklist`) antes de construir cualquiera de las tres plantillas de impresión.
+
+* **Respuestas correctas del examen de inducción SST embebidas en el bundle del cliente**
+  - **Archivo y Línea:** `src/pages/PublicInductionEvaluation.jsx:10-231` (objeto `DEFAULT_CUESTIONARIOS`, campo `correct` en cada pregunta)
+  - **Descripción breve:** El banco de preguntas del examen de inducción de seguridad industrial, incluyendo cuál opción es la correcta para cada pregunta, se define como un objeto JavaScript plano que se envía completo al navegador de cualquier visitante.
+  - **Impacto:** Cualquiera puede leer el código fuente servido (basta abrir las herramientas de desarrollador) y obtener el 100% de aciertos sin conocer nada de seguridad industrial. El resultado alimenta un certificado de inducción "vigente por 1 año" (`:399-401`), es decir, la aplicación puede certificar formalmente que una persona conoce los protocolos de seguridad del sitio cuando en realidad nunca los leyó — riesgo directo de seguridad laboral, no solo informático.
+  - **Remediación:** Mover el banco de preguntas y la corrección a una función server-side (Supabase Edge Function/RPC). El cliente debe recibir únicamente el texto de la pregunta y las opciones, nunca cuál es la correcta; el servidor calcula el puntaje y devuelve solo el resultado (aprobado/reprobado + puntaje).
+
+* **Resultado de evaluación (aprobado/reprobado y puntaje) calculado 100% en el cliente, sin revalidación en servidor**
+  - **Archivo y Línea:** `src/pages/PublicEvaluation.jsx:92-116`, `src/pages/PublicInductionEvaluation.jsx:373-419`
+  - **Descripción breve:** Ambos flujos de evaluación pública calculan `finalScore`/`finalPassed` comparando las respuestas del usuario contra `q.correct` enteramente en JavaScript del navegador, y luego escriben ese resultado directamente en el dataset compartido (ver hallazgo de acceso no autenticado, arriba).
+  - **Impacto:** Incluso si se ocultara el banco de respuestas (hallazgo anterior), nada impide construir directamente una petición que fije `passed: true, score: 100` para cualquier número de documento, falsificando una certificación de cumplimiento HSEQ sin siquiera abrir el formulario de preguntas.
+  - **Remediación:** El servidor debe ser la única fuente de verdad del resultado: el cliente envía `{ documento, respuestas }`, una función server-side (que mantiene las respuestas correctas fuera del alcance del cliente) calcula el puntaje y persiste el resultado; el cliente solo recibe de vuelta aprobado/reprobado y, si aplica, el código de certificado.
+
+* **Códigos de certificado secuenciales y predecibles + endpoint público de verificación que expone PII por enumeración**
+  - **Archivo y Línea:** `src/pages/PublicInductionEvaluation.jsx:394` (generación del código), `:278-291` (lookup público vía parámetro `?verify=`)
+  - **Descripción breve:** El código de certificado se construye como `IND-2026-<contador secuencial derivado de records.length>`, sin firma ni componente aleatorio. El parámetro de URL `?verify=<código>` hace una búsqueda directa (`records.find(...)`) sobre el mismo arreglo completo y sin autenticación del hallazgo de acceso no autenticado, y si encuentra coincidencia muestra nombre, cédula, cargo, ciudad y proyecto del titular sin ningún control de acceso.
+  - **Impacto:** Al ser una secuencia corta y predecible, es viable iterar códigos (`IND-2026-101`, `102`, `103`, ...) desde la URL pública de verificación y extraer datos personales del historial completo de inducciones de la organización, sin necesidad de conocer ningún dato previo de la víctima.
+  - **Remediación:** Generar el código con un componente no predecible y firmado (HMAC sobre el id del registro, o directamente un UUID), y mover la verificación a una función server-side que devuelva únicamente "válido/no válido" + nombre (sin cédula ni demás PII), con rate-limiting sobre ese endpoint.
 
 ---
 
@@ -91,6 +127,54 @@
   - **Impacto:** Si el rate-limiting de Supabase Auth no está explícitamente configurado de forma estricta, la aplicación no aporta ninguna capa adicional de defensa contra ataques de fuerza bruta o credential stuffing contra las cuentas registradas.
   - **Remediación:** Habilitar y verificar el rate limiting nativo de Supabase Auth para el proyecto, y añadir en el cliente un backoff progresivo simple (deshabilitar el botón de envío incrementalmente tras fallos consecutivos) como defensa en profundidad, documentando la dependencia de la configuración del backend.
 
+* **Directorio completo de usuarios (email, nombre, rol) expuesto a cualquier cuenta autenticada, sin filtrar por rol**
+  - **Archivo y Línea:** `src/hooks/useAppUsers.js:36-39, 57-66`
+  - **Descripción breve:** `useAppUsers` hace `select('email, name, role')` sobre la tabla `profiles` sin ninguna cláusula `.eq()`/filtro, y además suscribe a **todos** los cambios en tiempo real de esa tabla — para cualquier usuario autenticado, sea cual sea su rol.
+  - **Impacto:** Cualquier cuenta, incluida la de menor privilegio, puede enumerar el correo, nombre y rol exacto de cada persona registrada en el sistema, incluyendo quién es administrador — información útil para dirigir ingeniería social o phishing selectivo contra las cuentas más privilegiadas.
+  - **Remediación:** Restringir vía RLS qué columnas/filas de `profiles` puede leer un usuario no-admin (por ejemplo, exponer solo `name` para el directorio general, y reservar `email`/`role` completo a administradores), o servir el directorio a través de una vista/función que ya aplique ese recorte.
+
+* **Condición de carrera "último en escribir gana" sin bloqueo optimista en la sincronización local/remota**
+  - **Archivo y Línea:** `src/hooks/useLocalStorage.js:46-68, 129-154`
+  - **Descripción breve:** La sincronización compara marcas de tiempo (`updated_at` remoto vs. `_local_updated_at`) para decidir si sobrescribe, pero `setValue` siempre sube el snapshot local **completo** sin fusionar cambios ni verificar que nadie más haya escrito esa misma clave entre la lectura y la escritura.
+  - **Impacto:** Dos usuarios editando la misma clave de forma concurrente (p. ej. dos personas actualizando la matriz de riesgos al mismo tiempo) pueden perder silenciosamente los cambios del otro, sin ningún aviso ni conflicto reportado. Esto aplica también a las claves "públicas" del hallazgo de acceso no autenticado, agravando el riesgo de pérdida de datos allí.
+  - **Remediación:** Migrar a filas individuales por registro (ver remediación del primer hallazgo ALTO), donde Postgres/Supabase maneja la concurrencia a nivel de fila; si se mantiene el esquema de blob JSON en el corto plazo, agregar una verificación de versión/ETag que rechace la escritura si el remoto cambió desde la última lectura, en vez de sobrescribir ciegamente.
+
+* **Mensajes de error crudos del backend expuestos directamente al usuario final**
+  - **Archivo y Línea:** `src/components/ExportModal.jsx:107`; `src/pages/AdminSettings.jsx:208,228`; `src/pages/LegalMatrix.jsx:218`; `src/pages/RisksSst.jsx:385`; `src/pages/SystemDocs.jsx:179,263,437,548`
+  - **Descripción breve:** Nueve ocurrencias del mismo patrón (`alert('...' + err.message)`) muestran directamente al usuario el mensaje de error crudo devuelto por Supabase/PostgREST o por la API de OneDrive.
+  - **Impacto:** Estos mensajes pueden filtrar detalles internos (nombres de tabla/columna, restricciones de base de datos, códigos de error del proveedor) útiles para un atacante en fase de reconocimiento, además de dar una experiencia de usuario poco profesional ante fallos comunes.
+  - **Remediación:** Registrar el error crudo solo en consola/telemetría interna, y mostrar al usuario un mensaje genérico y traducido; si se necesita detalle para soporte, ofrecerlo en una sección "ver detalle técnico" plegada, no en el `alert` principal.
+
+* **Protección contra auto-escalación de rol basada únicamente en el atributo HTML `disabled`**
+  - **Archivo y Línea:** `src/pages/AdminSettings.jsx:187-210` (`handleRoleChange`), `:459` (`<select disabled={...}>`)
+  - **Descripción breve:** El selector de rol se deshabilita en el DOM para la cuenta fija de administrador y para la propia sesión, pero `handleRoleChange` —la función que realmente ejecuta el cambio— no repite ninguna validación equivalente: es el mismo código que se dispararía si el `<select>` no estuviera deshabilitado.
+  - **Impacto:** Cualquier usuario autenticado que ya haya llegado a esta pantalla puede disparar manualmente el evento `onChange` (o llamar directamente a la actualización de Supabase que usa la misma ruta) para cambiar el rol de cualquier perfil, incluido el propio, sin que el `disabled` cosmético lo impida.
+  - **Remediación:** Agregar la verificación real en el backend (política RLS o una función `SECURITY DEFINER` que confirme que quien llama ya es administrador antes de permitir el `update` de `role`), de modo que la protección no dependa de que el botón esté deshabilitado en el navegador.
+
+* **Auto-registro de asistencia/inducción sin verificar la identidad real del participante**
+  - **Archivo y Línea:** `src/pages/PublicEvaluation.jsx:63-70,118-141`; `src/pages/PublicInductionAttendance.jsx` (formulario completo); `src/pages/PublicInductionEvaluation.jsx:329-359` (`showManualForm`)
+  - **Descripción breve:** Estos formularios públicos permiten crear un registro nuevo de asistencia/inducción con cualquier número de documento escrito a mano, sin verificar contra ninguna fuente que esa persona/cédula exista realmente en la organización.
+  - **Impacto:** Cualquiera puede generar registros falsos de asistencia a comités, capacitaciones o inducciones de seguridad para una cédula inventada (o la de un tercero), lo que en un sistema HSEQ equivale a poder falsificar evidencia de cumplimiento normativo en seguridad y salud en el trabajo.
+  - **Remediación:** Exigir que el registro ya exista (creado previamente por un proceso interno/RRHH) antes de permitir que el formulario público lo complete/actualice, en lugar de permitir que un formulario público cree identidades nuevas libremente.
+
+* **Datos personales de identificación (cédula) sin cifrado de campo ni política de retención documentada**
+  - **Archivo y Línea:** mecanismo general en `src/hooks/useLocalStorage.js`; campo de cédula recolectado en `PublicAttendance.jsx`, `PublicInductionAttendance.jsx`, `PublicInductionEvaluation.jsx`, `PublicEvaluation.jsx`, `PublicCommitteeAttendance.jsx`
+  - **Descripción breve:** El número de documento de identidad se guarda en texto plano, indefinidamente, dentro de un blob JSON genérico, sin ninguna protección a nivel de campo ni una política de retención/purga documentada.
+  - **Impacto:** Independientemente de que se corrija el control de acceso (hallazgo ALTO), mantener un identificador nacional en texto plano sin límite de retención aumenta la exposición ante cualquier otro incidente futuro (respaldo mal asegurado, herramienta de soporte, otro bug) — relevante bajo la Ley 1581 de 2012 de Protección de Datos Personales en Colombia.
+  - **Remediación:** Definir y documentar un período de retención, enmascarar/tokenizar el número de documento en cualquier vista exportada o registrada en logs, y evaluar cifrado a nivel de columna en Postgres para ese campo específico.
+
+* **Dependencia de producción `react-router-dom` con múltiples vulnerabilidades conocidas**
+  - **Archivo y Línea:** `package.json` (`"react-router-dom": "^7.16.0"`, resuelve dentro del rango vulnerable según `npm audit`)
+  - **Descripción breve:** La versión instalada cae dentro del rango afectado por varios advisories públicos: open redirect vía `<Link>`/`useNavigate`, XSS por validación de protocolo insuficiente en el manejo de errores de RSC, denegación de servicio por matching de rutas ineficiente, y un bypass de CSRF en modo RSC.
+  - **Impacto:** A diferencia de otras dependencias vulnerables solo en tiempo de desarrollo, `react-router-dom` se ejecuta en el navegador de cada usuario final en producción, por lo que estas fallas (especialmente el open redirect y el XSS) son explotables directamente contra usuarios reales de la aplicación desplegada.
+  - **Remediación:** Ejecutar `npm update react-router-dom` a la versión parcheada más reciente compatible y agregar `npm audit --audit-level=high` (o equivalente) como paso de CI para bloquear regresiones futuras.
+
+* **Dependencias de la cadena de build (`vite`/`esbuild`) con vulnerabilidades del servidor de desarrollo**
+  - **Archivo y Línea:** `package.json` (`"vite": "^5.2.0"`, resuelve dentro del rango vulnerable `<=6.4.2` según `npm audit`)
+  - **Descripción breve:** El servidor de desarrollo de Vite en esta versión es vulnerable a path traversal en el manejo de archivos `.map` de dependencias optimizadas y a un bypass de `server.fs.deny` en Windows.
+  - **Impacto:** El impacto se limita principalmente al entorno de desarrollo/CI (`npm run dev`), no al build de producción servido por Vercel; aun así, si algún desarrollador expone `vite dev`/`vite preview` en una red no confiable, un atacante en esa red podría leer archivos fuera de la raíz del proyecto.
+  - **Remediación:** Actualizar a la última versión estable de Vite que corrija estos advisories (`npm audit fix` o actualización manual de mayor versión), y evitar exponer los servidores de desarrollo/preview en interfaces de red no confiables.
+
 ---
 
 ### 🟢 BAJAS
@@ -113,19 +197,37 @@
   - **Impacto:** No es una vulnerabilidad de seguridad explotable, pero es una desviación de buenas prácticas que puede inducir a error al usuario sobre el estado real de una operación que maneja documentos corporativos sensibles (p. ej., mostrar "90%" mientras la subida real ya falló silenciosamente si no se maneja bien la carrera entre el intervalo y el `fetch`).
   - **Remediación:** Usar `XMLHttpRequest` con el evento `upload.onprogress`, o `fetch` con `ReadableStream`, para reflejar el progreso real en lugar de simularlo.
 
+* **Generación de identificadores con `Date.now()`/`Math.random()` en vez de un generador criptográfico**
+  - **Archivo y Línea:** `src/utils/activityLogger.js:21,48`; `src/pages/Bsc.jsx:132`; `src/pages/Committees.jsx:149,181,238,255`; `src/pages/SystemDocs.jsx:270`; `src/pages/PublicInductionEvaluation.jsx:340`
+  - **Descripción breve:** Múltiples registros usan `Date.now()`, `Math.random()` o su combinación como identificador único, en vez de un generador criptográficamente seguro.
+  - **Impacto:** En la mayoría de estos casos son solo IDs internos de registros (impacto bajo). El caso a vigilar es `Committees.jsx:181`: ese mismo id (`Date.now()`, predecible) es el único "token" usado en la URL pública sin autenticación `/asistencia-comite/:id` (QR de firma de asistencia). Hoy ese flujo específico parece no funcionar para un visitante anónimo genuino en otro dispositivo (la clave `sgi_committees` no está en la lista de claves "públicas" de `useLocalStorage.js`, así que nunca sincroniza sin sesión), lo que limita la explotabilidad actual — pero conviene corregir el esquema de ID antes de que alguien "arregle" ese bug de sincronización sin arreglar también esto.
+  - **Remediación:** Usar `crypto.randomUUID()` para cualquier identificador, y especialmente para los que además funcionan como token de acceso en una URL pública.
+
+* **Registro verboso de payloads completos (incluye datos de otros usuarios) en la consola del navegador de producción**
+  - **Archivo y Línea:** `src/hooks/useLocalStorage.js:52,84,91,110`
+  - **Descripción breve:** Cada actualización en tiempo real y cada decisión de sincronización se imprime con `console.log`, incluyendo el payload completo recibido (que puede contener nombres, cédulas, descripciones de otros usuarios).
+  - **Impacto:** Cualquiera con las herramientas de desarrollador abiertas (o una extensión de navegador maliciosa) puede leer en la consola datos de otros usuarios que no debería ver, durante el uso normal de la aplicación.
+  - **Remediación:** Eliminar estos `console.log`, o condicionarlos a `import.meta.env.DEV` para que nunca se ejecuten en producción.
+
+* **Regla de lint de seguridad desactivada explícitamente + instancias reales sin la protección que evitaría**
+  - **Archivo y Línea:** `.eslintrc.cjs` (`'react/jsx-no-target-blank': 'off'`); `src/pages/Inductions.jsx:588,607` (`target="_blank"` sin `rel="noopener noreferrer"`)
+  - **Descripción breve:** El proyecto desactiva explícitamente la regla de ESLint que exige `rel="noopener noreferrer"` en enlaces `target="_blank"`, y efectivamente hay dos enlaces en el código que no la llevan.
+  - **Impacto:** Bajo hoy, porque ambos `href` son rutas internas fijas, no URLs controladas por el usuario (no hay reverse tabnabbing real en estos dos casos concretos). El problema es que, al estar la regla apagada a nivel de proyecto, cualquier enlace futuro con una URL dinámica/de usuario y `target="_blank"` quedaría igual de desprotegido sin que el linter lo detecte.
+  - **Remediación:** Reactivar `'react/jsx-no-target-blank': 'error'` en `.eslintrc.cjs` y agregar `rel="noopener noreferrer"` a los dos enlaces señalados.
+
 ---
 
 ## Resumen Ejecutivo
 
 | Severidad | Cantidad |
 |---|---|
-| 🔴 Altas | 3 |
-| 🟡 Medias | 4 |
-| 🟢 Bajas | 3 |
-| **Total** | **10** |
+| 🔴 Altas | 7 |
+| 🟡 Medias | 12 |
+| 🟢 Bajas | 6 |
+| **Total** | **25** |
 
-**Recomendación general:** el riesgo más urgente de este repositorio es que **la autorización (quién es admin, quién puede cambiar roles) se decide en el navegador**, no en el servidor — las tres vulnerabilidades ALTAS son variaciones del mismo problema raíz (control de acceso no verificado / *broken access control*, OWASP A01:2021). Antes de cualquier otro esfuerzo de hardening, el equipo debe: (1) auditar y reforzar las políticas RLS de Supabase para que repliquen server-side cada regla de autorización hoy solo presente en React, (2) eliminar el correo de administrador hardcodeado del bundle del cliente, y (3) sanitizar/escapar cualquier dato de usuario antes de interpolarlo en HTML exportable. Las MEDIAS (tokens en `localStorage`, fallback silencioso de configuración, inyección de fórmulas, ausencia de rate-limiting explícito) deben planificarse para el próximo sprint de seguridad. Las BAJAS no bloquean un release pero conviene resolverlas como parte de la limpieza técnica general.
+**Recomendación general:** la revisión ampliada confirma y agrava el diagnóstico original — este sistema decide casi toda su seguridad (quién es admin, qué datos puede leer/escribir un visitante anónimo, si un examen de cumplimiento HSEQ fue aprobado) **en el navegador**, no en el servidor. El hallazgo más severo de esta segunda pasada es que cuatro claves de datos (encuestas de clientes, capacitaciones, reportes de actos inseguros y registros de inducción) son legibles y **escribibles por completo, sin ninguna autenticación**, a través de `useLocalStorage.js` — esto no es una falla puntual sino un patrón arquitectónico que también compromete la integridad de esos mismos datos (condición de carrera) y, combinado con el examen de inducción cuyas respuestas viajan al cliente y cuyo resultado se calcula sin revalidación en el servidor, permite falsificar certificaciones de seguridad industrial de principio a fin sin tocar la interfaz de la aplicación. Prioridad inmediata para el equipo: (1) migrar las 4 claves "públicas" de blobs JSON a tablas con una fila por registro y RLS real, (2) mover el banco de respuestas y el cálculo de aprobado/reprobado de los exámenes a una función server-side, (3) eliminar las 4 copias del correo de administrador hardcodeado, y (4) sanitizar/escapar cualquier dato de usuario antes de interpolarlo en HTML exportable. Las MEDIAS (directorio de usuarios sin filtrar, mensajes de error crudos, protección de rol basada solo en atributo `disabled`, dependencias con CVEs conocidas, entre otras) deben entrar al próximo sprint de seguridad. Las BAJAS no bloquean un release pero conviene resolverlas como limpieza técnica general, y varias de ellas (IDs predecibles, lint de seguridad desactivado) son exactamente el tipo de "detalle menor" que suele convertirse en la puerta de entrada de la siguiente vulnerabilidad si se deja acumular.
 
 ---
 
-*Análisis generado mediante revisión estática manual (SAST) del código fuente del repositorio, correlacionado con búsquedas dirigidas por patrones de riesgo (control de acceso, manejo de secretos, sumideros de HTML/exportación).*
+*Análisis generado mediante revisión estática manual (SAST) del código fuente del repositorio (segunda pasada ampliada a la totalidad de `src/`, configuración de build/lint y dependencias vía `npm audit`), correlacionado con búsquedas dirigidas por patrones de riesgo (control de acceso, manejo de secretos, sumideros de HTML/exportación, generación de identificadores).*
